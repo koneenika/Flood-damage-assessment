@@ -1,0 +1,394 @@
+// ============================================
+// FLOOD IMPACT ASSESSMENT WITH AREA CALCULATION
+// ============================================
+
+// STEP 1: LOAD YOUR AOI SHAPEFILE
+// Upload your shapefile as an asset and replace the path below
+var aoi = ee.FeatureCollection('projects/ee9--iirs9003krupali/assets/punjab');
+
+// Alternatively, you can draw a geometry and use it as AOI
+// Uncomment the line below if using drawn geometry
+// var aoi = geometry;
+
+// Visualize AOI
+Map.centerObject(aoi, 10);
+Map.addLayer(aoi, {color: 'red'}, 'Area of Interest');
+
+// STEP 2: LOAD PRE-FLOOD IMAGE
+// OPTION A: Single scene (if it covers your AOI)
+/*
+var imagePre = ee.Image(
+  ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")  
+    .filterDate('2025-05-01', '2025-06-30')
+    .filterBounds(aoi)
+    .sort('CLOUD_COVER')
+    .first()
+);
+*/
+
+// OPTION B: MOSAIC multiple scenes (RECOMMENDED if AOI spans multiple tiles)
+var imagePreCollection = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
+    .filterDate('2025-05-01', '2025-06-30')
+    .filterBounds(aoi)
+    .filter(ee.Filter.lt('CLOUD_COVER', 20)); // Only use images with <20% cloud
+
+// Create mosaic (combines multiple scenes)
+var imagePre = imagePreCollection.median().clip(aoi);
+// Alternative: use .mosaic() for most recent pixels, or .mean() for average
+
+print('Pre-Flood Images Count:', imagePreCollection.size());
+print('Pre-Flood Image:', imagePre);
+
+// STEP 3: LOAD POST-FLOOD IMAGE
+// OPTION A: Single scene
+/*
+var imagePost = ee.Image(
+  ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")  
+    .filterDate('2025-09-01', '2025-10-23')
+    .filterBounds(aoi)
+    .sort('CLOUD_COVER')
+    .first()
+);
+*/
+
+// OPTION B: MOSAIC multiple scenes (RECOMMENDED)
+var imagePostCollection = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
+    .filterDate('2025-09-01', '2025-10-23')
+    .filterBounds(aoi)
+    .filter(ee.Filter.lt('CLOUD_COVER', 20));
+
+var imagePost = imagePostCollection.median().clip(aoi);
+
+print('Post-Flood Images Count:', imagePostCollection.size());
+print('Post-Flood Image:', imagePost);
+
+// Visualization parameters
+var vizParams = {
+  bands: ['SR_B4', 'SR_B3', 'SR_B2'],
+  min: 8300,
+  max: 17100,
+};
+
+Map.addLayer(imagePre.clip(aoi), vizParams, 'Pre-Flood RGB', false);
+Map.addLayer(imagePost.clip(aoi), vizParams, 'Post-Flood RGB', false);
+
+// ============================================
+// STEP 4: CALCULATE NDWI (WATER INDEX)
+// ============================================
+
+var ndwiPre = imagePre.normalizedDifference(['SR_B3', 'SR_B5']).rename('NDWI_Pre');
+var ndwiPost = imagePost.normalizedDifference(['SR_B3', 'SR_B5']).rename('NDWI_Post');
+
+// NDWI Change (Positive values = water increase = flooding)
+var ndwiChange = ndwiPost.subtract(ndwiPre).rename('NDWI_Change');
+
+var ndwiParams = {
+  min: -0.4, 
+  max: 0.4,
+  palette: ['brown', 'white', 'blue']
+};
+
+Map.addLayer(ndwiPre.clip(aoi), ndwiParams, 'NDWI Pre-Flood', false);
+Map.addLayer(ndwiPost.clip(aoi), ndwiParams, 'NDWI Post-Flood', false);
+
+// Visualize NDWI change
+var ndwiChangeParams = {
+  min: -0.2,
+  max: 0.2,
+  palette: ['red', 'white', 'blue']
+};
+Map.addLayer(ndwiChange.clip(aoi), ndwiChangeParams, 'NDWI Change (Flood Signature)');
+
+// ============================================
+// STEP 5: CALCULATE NDVI (VEGETATION INDEX)
+// ============================================
+
+var ndviPre = imagePre.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI_Pre');
+var ndviPost = imagePost.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI_Post');
+
+// NDVI Change (Negative values = vegetation damage)
+var ndviChange = ndviPost.subtract(ndviPre).rename('NDVI_Change');
+
+var ndviParams = {
+  min: 0,
+  max: 0.5,
+  palette: ['brown', 'yellow', 'green']
+};
+
+Map.addLayer(ndviPre.clip(aoi), ndviParams, 'NDVI Pre-Flood', false);
+Map.addLayer(ndviPost.clip(aoi), ndviParams, 'NDVI Post-Flood', false);
+
+var ndviChangeParams = {
+  min: -0.3,
+  max: 0.3,
+  palette: ['red', 'white', 'green']
+};
+Map.addLayer(ndviChange.clip(aoi), ndviChangeParams, 'NDVI Change (Vegetation Damage)');
+
+// ============================================
+// STEP 6: IDENTIFY FLOODED AREAS
+// ============================================
+
+// Define threshold for flooded areas (NDWI increase > 0.1)
+var floodThreshold = 0.1;
+var floodedAreas = ndwiChange.gt(floodThreshold).selfMask().rename('Flooded');
+
+Map.addLayer(floodedAreas.clip(aoi), {palette: ['blue']}, 'Flooded Areas');
+
+// ============================================
+// STEP 7: IDENTIFY VEGETATION DAMAGE
+// ============================================
+
+// Define threshold for vegetation damage (NDVI decrease < -0.1)
+var vegDamageThreshold = -0.1;
+var vegetationDamage = ndviChange.lt(vegDamageThreshold).selfMask().rename('Veg_Damage');
+
+Map.addLayer(vegetationDamage.clip(aoi), {palette: ['red']}, 'Vegetation Damage');
+
+// ============================================
+// STEP 8: CALCULATE AFFECTED AREAS IN HECTARES
+// ============================================
+
+// Calculate pixel area in square meters
+var pixelArea = ee.Image.pixelArea();
+
+// Calculate flooded area
+var floodedAreaImage = floodedAreas.multiply(pixelArea).divide(10000); // Convert to hectares
+var floodedAreaStats = floodedAreaImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+// Calculate vegetation damage area
+var vegDamageAreaImage = vegetationDamage.multiply(pixelArea).divide(10000);
+var vegDamageAreaStats = vegDamageAreaImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+// Calculate total AOI area
+var totalAreaImage = ee.Image.constant(1).clip(aoi).multiply(pixelArea).divide(10000);
+var totalAreaStats = totalAreaImage.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+// ============================================
+// STEP 9: DISPLAY RESULTS
+// ============================================
+
+print('========================================');
+print('FLOOD IMPACT ASSESSMENT RESULTS');
+print('========================================');
+
+var floodedHectares = floodedAreaStats.getNumber('Flooded');
+var vegDamageHectares = vegDamageAreaStats.getNumber('Veg_Damage');
+var totalHectares = totalAreaStats.getNumber('constant');
+
+print('Total AOI Area:', totalHectares.format('%.2f'), 'hectares');
+print('Flooded Area:', floodedHectares.format('%.2f'), 'hectares');
+print('Vegetation Damage Area:', vegDamageHectares.format('%.2f'), 'hectares');
+
+// Calculate percentages
+var floodedPercent = floodedHectares.divide(totalHectares).multiply(100);
+var vegDamagePercent = vegDamageHectares.divide(totalHectares).multiply(100);
+
+print('Flooded Area (%):', floodedPercent.format('%.2f'), '%');
+print('Vegetation Damage (%):', vegDamagePercent.format('%.2f'), '%');
+
+print('========================================');
+print('NDWI STATISTICS');
+print('========================================');
+
+var ndwiPreStats = ndwiPre.reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.min(), 
+    sharedInputs: true
+  }).combine({
+    reducer2: ee.Reducer.max(), 
+    sharedInputs: true
+  }),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+var ndwiPostStats = ndwiPost.reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.min(), 
+    sharedInputs: true
+  }).combine({
+    reducer2: ee.Reducer.max(), 
+    sharedInputs: true
+  }),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+print('NDWI Pre-Flood:', ndwiPreStats);
+print('NDWI Post-Flood:', ndwiPostStats);
+
+print('========================================');
+print('NDVI STATISTICS');
+print('========================================');
+
+var ndviPreStats = ndviPre.reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.min(), 
+    sharedInputs: true
+  }).combine({
+    reducer2: ee.Reducer.max(), 
+    sharedInputs: true
+  }),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+var ndviPostStats = ndviPost.reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.min(), 
+    sharedInputs: true
+  }).combine({
+    reducer2: ee.Reducer.max(), 
+    sharedInputs: true
+  }),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e13
+});
+
+print('NDVI Pre-Flood:', ndviPreStats);
+print('NDVI Post-Flood:', ndviPostStats);
+
+// ============================================
+// STEP 10: EXPORT RESULTS (OPTIONAL)
+// ============================================
+
+// Export flooded areas as GeoTIFF
+Export.image.toDrive({
+  image: floodedAreas.clip(aoi),
+  description: 'Flooded_Areas',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+// Export vegetation damage as GeoTIFF
+Export.image.toDrive({
+  image: vegetationDamage.clip(aoi),
+  description: 'Vegetation_Damage',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+// Create a summary feature for export
+var summary = ee.Feature(aoi.geometry(), {
+  'Total_Area_ha': totalHectares,
+  'Flooded_Area_ha': floodedHectares,
+  'Flooded_Percent': floodedPercent,
+  'Veg_Damage_Area_ha': vegDamageHectares,
+  'Veg_Damage_Percent': vegDamagePercent,
+  'Pre_Date': imagePre.date().format('YYYY-MM-dd'),
+  'Post_Date': imagePost.date().format('YYYY-MM-dd')
+});
+
+// Export summary as shapefile
+Export.table.toDrive({
+  collection: ee.FeatureCollection([summary]),
+  description: 'Flood_Impact_Summary',
+  fileFormat: 'SHP'
+});
+
+print('========================================');
+print('Export tasks created. Check the Tasks tab to run them.');
+print('========================================');
+
+
+
+
+
+
+// ============================================
+// STEP 11: EXPORT ALL MAP VISUALIZATIONS
+// ============================================
+
+// 1) Export Pre-Flood RGB
+Export.image.toDrive({
+  image: imagePre.clip(aoi).select(['SR_B4','SR_B3','SR_B2']),
+  description: 'Pre_Flood_RGB',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+// 2) Export Post-Flood RGB
+Export.image.toDrive({
+  image: imagePost.clip(aoi).select(['SR_B4','SR_B3','SR_B2']),
+  description: 'Post_Flood_RGB',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+// 3) NDWI PRE
+Export.image.toDrive({
+  image: ndwiPre.clip(aoi),
+  description: 'NDWI_Pre',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+// 4) NDWI POST
+Export.image.toDrive({
+  image: ndwiPost.clip(aoi),
+  description: 'NDWI_Post',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+// 5) NDWI CHANGE
+Export.image.toDrive({
+  image: ndwiChange.clip(aoi),
+  description: 'NDWI_Change',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+// 6) NDVI PRE
+Export.image.toDrive({
+  image: ndviPre.clip(aoi),
+  description: 'NDVI_Pre',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+// 7) NDVI POST
+Export.image.toDrive({
+  image: ndviPost.clip(aoi),
+  description: 'NDVI_Post',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
+
+// 8) NDVI CHANGE
+Export.image.toDrive({
+  image: ndviChange.clip(aoi),
+  description: 'NDVI_Change',
+  scale: 30,
+  region: aoi,
+  maxPixels: 1e13
+});
